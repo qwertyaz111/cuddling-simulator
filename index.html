@@ -171,7 +171,7 @@ let personA, personB, walkGroup;
 let currentView = '3rd';
 let hugMode = 'side';
 let backHugSide = 'left';
-let rotation = { x: 0.3, y: 0.8 }, camDist = 2.5, isDragging = false, previousTouch = null;
+let rotation = { x: 0.3, y: 0.8 }, camDist = 2.5, isDragging = false, previousTouch = null, initialPinchDist = null;
 
 function init() {
     scene = new THREE.Scene();
@@ -454,29 +454,24 @@ function animate() {
         const self = (currentView === 'A' ? personA : personB);
         const other = (currentView === 'A' ? personB : personA);
         
-        // 1. 目の位置（ヘッドパーツの中心）のワールド座標を取得
         const selfEyePos = new THREE.Vector3();
         self.headParts.getWorldPosition(selfEyePos);
         
-        // 2. 目の向き（ヘッドパーツの正面）のワールド方向を取得
-        const selfEyeDir = new THREE.Vector3(0, 0, 1); // マネキンのデフォルト正面はZ+
+        const selfEyeDir = new THREE.Vector3(0, 0, 1); 
         selfEyeDir.applyQuaternion(self.headParts.getWorldQuaternion(new THREE.Quaternion()));
 
         camera.position.copy(selfEyePos);
-        camera.up.set(0, 1, 0); // ワールドの「上」を固定して酔いを防止
+        camera.up.set(0, 1, 0); 
 
         if (hugMode === 'back' && currentView === 'A') {
-            // A（後ろ側）は前方の空間を見る
             const targetPos = new THREE.Vector3().addVectors(selfEyePos, selfEyeDir.multiplyScalar(10));
             camera.lookAt(targetPos);
         } else {
-            // それ以外（向き合っている状態）は相手の目を見る
             const otherEyePos = new THREE.Vector3();
             other.headParts.getWorldPosition(otherEyePos);
             camera.lookAt(otherEyePos);
         }
         
-        // マウス/スワイプによる自由回転を適用
         camera.rotateY(rotation.y);
         camera.rotateX(rotation.x);
     }
@@ -495,14 +490,50 @@ function setupControls() {
     c.addEventListener('mousedown', () => isDragging = true);
     window.addEventListener('mouseup', () => isDragging = false);
     window.addEventListener('mousemove', e => { if(isDragging) move(e.movementX, e.movementY); });
-    c.addEventListener('touchstart', e => { isDragging = true; previousTouch = e.touches[0]; }, { passive: false });
-    window.addEventListener('touchend', () => isDragging = false);
+
+    c.addEventListener('wheel', e => {
+        if (currentView === '3rd') {
+            camDist += e.deltaY * 0.002;
+            camDist = Math.max(0.5, Math.min(10, camDist));
+        }
+    }, { passive: true });
+
+    c.addEventListener('touchstart', e => { 
+        if (e.touches.length === 1) {
+            isDragging = true; 
+            previousTouch = e.touches[0]; 
+            initialPinchDist = null;
+        } else if (e.touches.length === 2 && currentView === '3rd') {
+            isDragging = false;
+            initialPinchDist = Math.hypot(
+                e.touches[0].clientX - e.touches[1].clientX,
+                e.touches[0].clientY - e.touches[1].clientY
+            );
+        }
+    }, { passive: false });
+
+    window.addEventListener('touchend', () => { 
+        isDragging = false; 
+        initialPinchDist = null;
+    });
+
     window.addEventListener('touchmove', e => {
-        if(!isDragging || !previousTouch) return;
-        if (e.cancelable) e.preventDefault();
-        const touch = e.touches[0];
-        move(touch.clientX - previousTouch.clientX, touch.clientY - previousTouch.clientY);
-        previousTouch = touch;
+        if (e.touches.length === 1 && isDragging && previousTouch) {
+            if (e.cancelable) e.preventDefault();
+            const touch = e.touches[0];
+            move(touch.clientX - previousTouch.clientX, touch.clientY - previousTouch.clientY);
+            previousTouch = touch;
+        } else if (e.touches.length === 2 && initialPinchDist !== null && currentView === '3rd') {
+            if (e.cancelable) e.preventDefault();
+            const currentDist = Math.hypot(
+                e.touches[0].clientX - e.touches[1].clientX,
+                e.touches[0].clientY - e.touches[1].clientY
+            );
+            const diff = currentDist - initialPinchDist;
+            camDist -= diff * 0.005;
+            camDist = Math.max(0.5, Math.min(10, camDist));
+            initialPinchDist = currentDist;
+        }
     }, { passive: false });
 }
 
