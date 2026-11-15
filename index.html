@@ -248,7 +248,16 @@ let personA, personB, walkGroup;
 let currentView = '3rd';
 let hugMode = 'side';
 let backHugSide = 'left';
-let rotation = { x: 0.3, y: 0.8 }, camDist = 2.5, isDragging = false, previousTouch = null, initialPinchDist = null;
+// 視点ごとに回転を別々に覚える（三人称に戻っても前の角度を失わない）
+const ROT_3RD_DEFAULT = { x: 0.3, y: 0.8 };
+let rot3rd = { ...ROT_3RD_DEFAULT };
+let rot1st = { x: 0, y: 0 };
+let rotation = rot3rd;
+let camDist = 2.5, isDragging = false, previousTouch = null, initialPinchDist = null;
+// 上下の回転は天井（真上）・床（真下）を越えさせない。越えると lookAt が裏返って
+// 左右を動かすたびに上下の効きが反転して見えるため、両視点とも必ずここで止める
+const PITCH_3RD_MIN = 0.02, PITCH_3RD_MAX = 1.45;   // 三人称：ほぼ水平〜真上の少し手前（床下にも潜らない）
+const PITCH_1ST_MIN = -1.35, PITCH_1ST_MAX = 1.35;  // 一人称：±約77度まで
 
 function init() {
     scene = new THREE.Scene();
@@ -437,16 +446,72 @@ function updateScene() {
     const deg10 = 10 * (Math.PI / 180);
 
     if (hugMode === 'side') {
+        const deg5 = 5 * (Math.PI / 180);
         const spreadA = personA.userData.shoulderW + (personA.userData.armLen * Math.sin(deg10));
         const spreadB = personB.userData.shoulderW + (personB.userData.armLen * Math.sin(deg10));
         const dist = spreadA + spreadB + 0.02;
 
         personA.position.z = -dist / 2; personA.rotation.y = -Math.PI / 2;
         personB.position.z = dist / 2; personB.rotation.y = -Math.PI / 2;
+
+        // 頭を揃える：目の高さ（体の軸方向の位置）が一致するよう、背の低い方を頭側へずらす
+        const maxEyeY = Math.max(personA.userData.eyeY, personB.userData.eyeY);
+        personA.position.y = maxEyeY - personA.userData.eyeY;
+        personB.position.y = maxEyeY - personB.userData.eyeY;
+
         [personA, personB].forEach(p => {
             p.arms.forEach((arm, i) => { arm.rotation.z = (i === 0 ? -1 : 1) * deg10; arm.rotation.x = 0; });
-            p.legs.forEach((leg, i) => { leg.rotation.z = (i === 0 ? -1 : 1) * deg10; });
+            // 脚の開きは腕より閉じ気味にする
+            p.legs.forEach((leg, i) => { leg.rotation.z = (i === 0 ? -1 : 1) * deg5; });
         });
+
+        // 手を繋ぐ：内側の腕（Aは arms[1]、Bは arms[0]）の先が、二人の間の
+        // 足側の一点で合うように両腕をその点へ向ける（腕が1本物なので、
+        // 目標点は短い方の腕がちょうど届く距離に置く。長い方の腕は少し行き過ぎて
+        // 手が重なる形になる）
+        const anchorOf = (p, i) => new THREE.Vector3(
+            0,
+            p.position.y + p.userData.shoulderY,
+            p.position.z + (i === 0 ? -1 : 1) * p.userData.shoulderW
+        );
+        const aA = anchorOf(personA, 1), aB = anchorOf(personB, 0);
+        const targetDist = Math.min(personA.userData.armLen, personB.userData.armLen);
+        const midY = (aA.y + aB.y) / 2, midZ = (aA.z + aB.z) / 2;
+        const halfDy = (aB.y - aA.y) / 2, halfDz = (aB.z - aA.z) / 2;
+        const drop = Math.sqrt(Math.max(0.09, targetDist * targetDist - halfDy * halfDy - halfDz * halfDz));
+        const clasp = new THREE.Vector3(0, midY - drop, midZ);
+        // 腕の長さが違うと片方が届かず・片方が行き過ぎて手が離れるので、
+        // 二人の胴体の間の範囲で目標点を少し探して、手先同士が一番近づく点にする
+        const zMin = Math.max(personA.position.z + personA.userData.width / 2 + 0.005, midZ - 0.07);
+        const zMax = Math.min(personB.position.z - personB.userData.width / 2 - 0.005, midZ + 0.07);
+        if (zMin < zMax) {
+            const tipGap = (c) => {
+                const tA = aA.clone().add(c.clone().sub(aA).normalize().multiplyScalar(personA.userData.armLen));
+                const tB = aB.clone().add(c.clone().sub(aB).normalize().multiplyScalar(personB.userData.armLen));
+                return tA.distanceTo(tB);
+            };
+            let best = tipGap(clasp), stepSize = 0.06;
+            for (let iter = 0; iter < 48; iter++) {
+                let improved = false;
+                for (const [dy, dz] of [[stepSize, 0], [-stepSize, 0], [0, stepSize], [0, -stepSize]]) {
+                    const cand = clasp.clone();
+                    cand.y = Math.max(midY - 0.9, Math.min(midY - 0.2, cand.y + dy));
+                    cand.z = Math.max(zMin, Math.min(zMax, cand.z + dz));
+                    const g = tipGap(cand);
+                    if (g < best - 1e-6) { best = g; clasp.copy(cand); improved = true; }
+                }
+                if (!improved) stepSize /= 2;
+            }
+        }
+        const aimArm = (p, i, anchor) => {
+            // グループ空間での目標方向 → 人物ローカル（rotation.y=-90度）では (z, y, -x)
+            const g = clasp.clone().sub(anchor).normalize();
+            const lx = g.z, ly = g.y, lz = -g.x;
+            p.arms[i].rotation.x = Math.atan2(-lz, -ly);
+            p.arms[i].rotation.z = Math.atan2(lx, Math.hypot(ly, lz));
+        };
+        aimArm(personA, 1, aA);
+        aimArm(personB, 0, aB);
     } else if (hugMode === 'front') {
         const dist = 0.34;
         personA.position.z = -dist / 2; personA.rotation.y = 0;
@@ -476,10 +541,14 @@ function updateScene() {
 
     walkGroup.add(personA, personB);
 
+    // 寝る向きの左右は「体の長軸まわりの寝返り」で切り替える。
+    // 以前は rotation.z の符号を反転していたため、頭と足の位置まで入れ替わって
+    // 画面が上下反転して見えた。z=+90度（頭の向きはそのまま）に x=180度を重ねると、
+    // 頭の位置を保ったまま顔の向きと下になる肩だけが入れ替わる。
     if (hugMode === 'back' && backHugSide === 'right') {
-        walkGroup.rotation.z = -Math.PI / 2;
+        walkGroup.rotation.set(Math.PI, 0, Math.PI / 2);
     } else {
-        walkGroup.rotation.z = Math.PI / 2;
+        walkGroup.rotation.set(0, 0, Math.PI / 2);
     }
 
     if (hugMode === 'side') {
@@ -526,7 +595,9 @@ function animate() {
         personA.headParts.lookAt(eyeB);
         personB.headParts.lookAt(eyeA);
     } else {
-        const forward = new THREE.Vector3(0, 0, 10).applyQuaternion(personA.quaternion).add(eyeA);
+        // 前方向はワールドでの向きで取る。personA.quaternion（ローカル）だと
+        // 右向きに寝た時にグループの反転が反映されず、Aの顔だけ後ろを向いてしまう
+        const forward = new THREE.Vector3(0, 0, 10).applyQuaternion(personA.getWorldQuaternion(new THREE.Quaternion())).add(eyeA);
         personA.headParts.lookAt(forward);
         personB.headParts.lookAt(eyeA);
     }
@@ -567,20 +638,37 @@ function animate() {
         
         camera.rotateY(rotation.y);
         camera.rotateX(rotation.x);
+        camera.rotation.z = 0; // 傾き（ロール）を残さない。残ると地平線が斜めになって上下・左右の効きが入れ替わる
     }
     renderer.render(scene, camera);
 }
 
 function setupControls() {
     const c = document.getElementById('canvas-container');
-    const move = (dx, dy) => { 
-        rotation.y -= dx * 0.005; 
+    const move = (dx, dy) => {
+        // 左右は他のシミュレーターと回る向きを揃える（右へ引いたら視点も右回り、
+        // 一人称なら右を向く）。元の符号だと左右だけ鏡のように逆に効いていた
+        rotation.y += dx * 0.005;
         rotation.x -= dy * 0.005;
+        // 上下は視点によらず必ず止める（天井・床を越えると上下の効きが反転する）
         if (currentView === '3rd') {
-            rotation.x = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, rotation.x));
+            rotation.x = Math.max(PITCH_3RD_MIN, Math.min(PITCH_3RD_MAX, rotation.x));
+        } else {
+            rotation.x = Math.max(PITCH_1ST_MIN, Math.min(PITCH_1ST_MAX, rotation.x));
         }
     };
     c.addEventListener('mousedown', () => isDragging = true);
+    // ダブルクリックで今の視点のカメラを初期位置へ戻す
+    c.addEventListener('dblclick', () => {
+        if (currentView === '3rd') {
+            rot3rd = { ...ROT_3RD_DEFAULT };
+            rotation = rot3rd;
+            camDist = 2.5;
+        } else {
+            rot1st = { x: 0, y: 0 };
+            rotation = rot1st;
+        }
+    });
     window.addEventListener('mouseup', () => isDragging = false);
     window.addEventListener('mousemove', e => { if(isDragging) move(e.movementX, e.movementY); });
 
@@ -605,8 +693,9 @@ function setupControls() {
         }
     }, { passive: false });
 
-    window.addEventListener('touchend', () => { 
-        isDragging = false; 
+    window.addEventListener('touchend', () => {
+        isDragging = false;
+        previousTouch = null;
         initialPinchDist = null;
     });
 
@@ -647,7 +736,13 @@ function switchView() {
     personB.headParts.visible = true; personB.nameTag.visible = true;
     if (currentView === 'A') { personA.headParts.visible = false; personA.nameTag.visible = false; }
     else if (currentView === 'B') { personB.headParts.visible = false; personB.nameTag.visible = false; }
-    rotation.x = 0; rotation.y = 0;
+    // 一人称は正面から始める。三人称は前に使っていた角度へ戻す（0,0の端からの視点に飛ばさない）
+    if (currentView === '3rd') {
+        rotation = rot3rd;
+    } else {
+        rot1st = { x: 0, y: 0 };
+        rotation = rot1st;
+    }
 }
 
 function shareToX() {
